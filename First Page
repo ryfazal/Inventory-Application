@@ -1,0 +1,483 @@
+<#
+.SYNOPSIS
+  Lightweight PowerShell app to track application/asset pickups, deliveries, and returns.
+
+.DESCRIPTION
+  - Single-file script with JSON persistence (no external DB required)
+  - Tracks assets (ID, name, serial, status, custodian, location) and transactions (pickup/delivery/return)
+  - Works on PowerShell 5.1+ and PowerShell 7+
+  - Includes an optional interactive console menu: Start-InventoryConsole
+
+.STORAGE
+  Default storage under %ProgramData%\AppInventory\inventory.json
+  Override with:  $env:APPINV_DB or -DbPath parameter on relevant commands
+
+#>
+
+#region === Configuration & Helpers ===
+
+$script:DefaultDbPath = if ($env:APPINV_DB) { $env:APPINV_DB } else { Join-Path $env:ProgramData 'AppInventory\inventory.json' }
+
+function Assert-DbFolder {
+  param([string]$Path)
+  $folder = Split-Path -Path $Path -Parent
+  if (-not (Test-Path $folder)) { New-Item -Path $folder -ItemType Directory -Force | Out-Null }
+}
+
+function Load-Db {
+  param([string]$DbPath = $script:DefaultDbPath)
+  Assert-DbFolder -Path $DbPath
+  if (-not (Test-Path $DbPath)) {
+    $db = @{ Version = 1; Created = (Get-Date).ToString('o'); Assets = @(); Transactions = @(); Custodians = @() }
+    $db | ConvertTo-Json -Depth 8 | Set-Content -Path $DbPath -Encoding UTF8
+  }
+  try {
+    (Get-Content -Path $DbPath -Raw -Encoding UTF8) | ConvertFrom-Json
+  } catch {
+    throw "Database file is corrupted: $DbPath"
+  }
+}
+
+function Save-Db {
+  param(
+    [Parameter(Mandatory)][hashtable]$Db,
+    [string]$DbPath = $script:DefaultDbPath
+  )
+  Assert-DbFolder -Path $DbPath
+  $Db | ConvertTo-Json -Depth 10 | Set-Content -Path $DbPath -Encoding UTF8
+}
+
+function New-Id {
+  ([guid]::NewGuid().Guid)
+}
+
+function NowIso { (Get-Date).ToString('o') }
+
+function Write-Transaction {
+  param(
+    [hashtable]$Db,
+    [string]$AssetId,
+    [ValidateSet('Pickup','Delivery','Return','Update')] [string]$Action,
+    [string]$By,
+    [string]$For,
+    [string]$FromLocation,
+    [string]$ToLocation,
+    [string]$Condition,
+    [string]$Notes,
+    [string]$ConfirmMethod,
+    [string]$ConfirmBy,
+    [string]$ConfirmHash
+  )
+  $tx = [ordered]@{
+    TxId        = New-Id
+    AssetId     = $AssetId
+    Action      = $Action
+    By          = $By
+    For         = $For
+    From        = $FromLocation
+    To          = $ToLocation
+    Condition   = $Condition
+    Notes       = $Notes
+    ConfirmMethod = $ConfirmMethod
+    ConfirmBy     = $ConfirmBy
+    ConfirmHash   = $ConfirmHash
+    Timestamp   = NowIso
+  }
+  $Db.Transactions += [pscustomobject]$tx
+}
+
+function Get-Hash {
+  param([Parameter(Mandatory)][string]$Text)
+  $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join ''
+}
+
+function ConvertFrom-SecureStringPlain {
+  param([securestring]$Secure)
+  $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
+  try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) } finally { if ($ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) } }
+}
+
+#endregion
+
+#region === Asset & Custodian Commands ===
+
+function Add-Custodian {
+  <#
+  .SYNOPSIS
+    Register a person who may pick up assets (for PIN confirmation or lookup).
+  .PARAMETER Name
+    Display name (must be unique)
+  .PARAMETER Contact
+    Optional email/phone
+  .PARAMETER Pin
+    Optional initial PIN that will be hashed and stored. Can be set later using Set-CustodianPin.
+  #>
+  [CmdletBinding()] param(
+    [Parameter(Mandatory)][string]$Name,
+    [string]$Contact,
+    [string]$Pin,
+    [string]$DbPath
+  )
+  $db = Load-Db -DbPath $DbPath
+  if ($db.Custodians | Where-Object { $_.Name -eq $Name }) { throw "Custodian already exists: $Name" }
+  $cust = [ordered]@{
+    CustodianId = New-Id
+    Name        = $Name
+    Contact     = $Contact
+    PinHash     = if ($Pin) { Get-Hash -Text $Pin } else { $null }
+    Created     = NowIso
+    Updated     = NowIso
+  }
+  $db.Custodians += [pscustomobject]$cust
+  Save-Db -Db $db -DbPath $DbPath
+  [pscustomobject]$cust
+}
+
+function Get-Custodian {
+  [CmdletBinding(DefaultParameterSetName='All')] param(
+    [Parameter(ParameterSetName='ByName', Mandatory)][string]$Name,
+    [Parameter(ParameterSetName='ById', Mandatory)][string]$Id,
+    [string]$DbPath
+  )
+  $db = Load-Db -DbPath $DbPath
+  switch ($PSCmdlet.ParameterSetName) {
+    'ByName' { $db.Custodians | Where-Object { $_.Name -eq $Name } }
+    'ById'   { $db.Custodians | Where-Object { $_.CustodianId -eq $Id } }
+    default  { $db.Custodians }
+  }
+}
+
+function Set-CustodianPin {
+  [CmdletBinding()] param(
+    [Parameter(Mandatory)][string]$Name,
+    [Parameter(Mandatory)][securestring]$Pin,
+    [string]$DbPath
+  )
+  $db = Load-Db -DbPath $DbPath
+  $cust = $db.Custodians | Where-Object { $_.Name -eq $Name }
+  if (-not $cust) { throw "Custodian not found: $Name" }
+  $plain = ConvertFrom-SecureStringPlain -Secure $Pin
+  $cust.PinHash = Get-Hash -Text $plain
+  $cust.Updated = NowIso
+  Save-Db -Db $db -DbPath $DbPath
+  $cust
+}
+
+#endregion
+
+#region === Asset Commands ===
+
+function Add-Asset {
+  <#
+  .SYNOPSIS
+    Create a new asset/application record.
+  .PARAMETER Name
+    Friendly asset/app name
+  .PARAMETER Serial
+    Serial number or license key
+  .PARAMETER Location
+    Starting location (e.g., Warehouse)
+  .PARAMETER Custodian
+    Person/team responsible initially
+  .PARAMETER Status
+    Defaults to InStock. Options: InStock, InTransit, WithUser, Returned, Retired
+  .PARAMETER Notes
+    Free text notes
+  .PARAMETER DbPath
+    Override default DB path
+  #>
+  [CmdletBinding()] param(
+    [Parameter(Mandatory)][string]$Name,
+    [string]$Serial,
+    [string]$Location = 'Warehouse',
+    [string]$Custodian,
+    [ValidateSet('InStock','InTransit','WithUser','Returned','Retired')][string]$Status = 'InStock',
+    [string]$Notes,
+    [string]$DbPath
+  )
+  $db = Load-Db -DbPath $DbPath
+  $asset = [ordered]@{
+    AssetId   = New-Id
+    Name      = $Name
+    Serial    = $Serial
+    Status    = $Status
+    Location  = $Location
+    Custodian = $Custodian
+    Notes     = $Notes
+    Created   = NowIso
+    Updated   = NowIso
+  }
+  $db.Assets += [pscustomobject]$asset
+  Write-Transaction -Db $db -AssetId $asset.AssetId -Action 'Update' -By $env:USERNAME -Notes "Asset created: $Name"
+  Save-Db -Db $db -DbPath $DbPath
+  [pscustomobject]$asset
+}
+
+function Get-Asset {
+  [CmdletBinding(DefaultParameterSetName='All')] param(
+    [Parameter(ParameterSetName='ById', Mandatory)][string]$Id,
+    [Parameter(ParameterSetName='ByQuery', Mandatory)][string]$Query,
+    [string]$DbPath
+  )
+  $db = Load-Db -DbPath $DbPath
+  switch ($PSCmdlet.ParameterSetName) {
+    'ById'   { $db.Assets | Where-Object { $_.AssetId -eq $Id } }
+    'ByQuery'{ $db.Assets | Where-Object { $_.Name -like "*${Query}*" -or $_.Serial -like "*${Query}*" } }
+    default  { $db.Assets }
+  }
+}
+
+function Set-Asset {
+  <# Update asset fields by ID #>
+  [CmdletBinding()] param(
+    [Parameter(Mandatory)][string]$Id,
+    [string]$Name,
+    [string]$Serial,
+    [string]$Status,
+    [string]$Location,
+    [string]$Custodian,
+    [string]$Notes,
+    [string]$DbPath
+  )
+  $db = Load-Db -DbPath $DbPath
+  $asset = $db.Assets | Where-Object { $_.AssetId -eq $Id }
+  if (-not $asset) { throw "Asset not found: $Id" }
+  foreach ($kv in @{'Name'=$Name; 'Serial'=$Serial; 'Status'=$Status; 'Location'=$Location; 'Custodian'=$Custodian; 'Notes'=$Notes}) {
+    if ($null -ne $kv.Value -and $kv.Value -ne '') { $asset.$($kv.Key) = $kv.Value }
+  }
+  $asset.Updated = NowIso
+  Write-Transaction -Db $db -AssetId $Id -Action 'Update' -By $env:USERNAME -Notes 'Asset updated'
+  Save-Db -Db $db -DbPath $DbPath
+  $asset
+}
+
+#endregion
+
+#region === Logistics Actions ===
+
+function Invoke-Pickup {
+  <#
+    Register a pickup; requires confirmation by the person picking up using either PIN or typed signature.
+  #>
+  [CmdletBinding()] param(
+    [Parameter(Mandatory)][string]$AssetId,
+    [Parameter(Mandatory)][string]$By,
+    [ValidateSet('PIN','Signature')][string]$ConfirmMethod = 'PIN',
+    [string]$SignatureName,
+    [string]$From = 'User',
+    [string]$To = 'Warehouse',
+    [string]$Condition,
+    [string]$Notes,
+    [string]$DbPath
+  )
+  $db = Load-Db -DbPath $DbPath
+  $asset = $db.Assets | Where-Object { $_.AssetId -eq $AssetId }
+  if (-not $asset) { throw "Asset not found: $AssetId" }
+
+  $confirmBy = $By
+  $confirmHash = $null
+
+  if ($ConfirmMethod -eq 'PIN') {
+    $cust = $db.Custodians | Where-Object { $_.Name -eq $By }
+    if (-not $cust) { throw "Custodian not found for PIN verification: $By. Use Add-Custodian and Set-CustodianPin first." }
+    if (-not $cust.PinHash) { throw "No PIN set for $By. Run Set-CustodianPin -Name '$By' -Pin (Read-Host -AsSecureString 'New PIN')" }
+    $pinSecure = Read-Host -AsSecureString -Prompt "Enter PIN for $By"
+    $pinPlain = ConvertFrom-SecureStringPlain -Secure $pinSecure
+    $hash = Get-Hash -Text $pinPlain
+    if ($hash -ne $cust.PinHash) { throw "PIN verification failed for $By" }
+    # bind the confirmation to this transaction
+    $confirmHash = Get-Hash -Text "PIN|$By|$AssetId|$(NowIso)"
+  } else {
+    if (-not $SignatureName) { $SignatureName = Read-Host "Type your full name as signature" }
+    if (-not $SignatureName) { throw "Signature name is required for signature confirmation" }
+    $confirmBy = $SignatureName
+    $confirmHash = Get-Hash -Text "SIG|$SignatureName|$By|$AssetId|$(NowIso)"
+  }
+
+  $asset.Status = 'InTransit'
+  $asset.Location = $To
+  $asset.Custodian = $By
+  $asset.Updated = NowIso
+  Write-Transaction -Db $db -AssetId $AssetId -Action 'Pickup' -By $By -FromLocation $From -ToLocation $To -Condition $Condition -Notes $Notes -ConfirmMethod $ConfirmMethod -ConfirmBy $confirmBy -ConfirmHash $confirmHash
+  Save-Db -Db $db -DbPath $DbPath
+  $asset
+}
+
+function Invoke-Delivery {
+  <# Register a delivery to a user or location. #>
+  [CmdletBinding()] param(
+    [Parameter(Mandatory)][string]$AssetId,
+    [Parameter(Mandatory)][string]$By,
+    [Parameter(Mandatory)][string]$To,
+    [string]$Location = 'Onsite',
+    [string]$Condition,
+    [string]$Notes,
+    [string]$DbPath
+  )
+  $db = Load-Db -DbPath $DbPath
+  $asset = $db.Assets | Where-Object { $_.AssetId -eq $AssetId }
+  if (-not $asset) { throw "Asset not found: $AssetId" }
+  $asset.Status = 'WithUser'
+  $asset.Location = $Location
+  $asset.Custodian = $To
+  $asset.Updated = NowIso
+  Write-Transaction -Db $db -AssetId $AssetId -Action 'Delivery' -By $By -For $To -FromLocation $asset.Location -ToLocation $Location -Condition $Condition -Notes $Notes
+  Save-Db -Db $db -DbPath $DbPath
+  $asset
+}
+
+function Invoke-Return {
+  <# Register a return from a user back to warehouse or another location. #>
+  [CmdletBinding()] param(
+    [Parameter(Mandatory)][string]$AssetId,
+    [Parameter(Mandatory)][string]$By,
+    [string]$From = 'User',
+    [string]$To = 'Warehouse',
+    [string]$Condition,
+    [string]$Notes,
+    [string]$DbPath
+  )
+  $db = Load-Db -DbPath $DbPath
+  $asset = $db.Assets | Where-Object { $_.AssetId -eq $AssetId }
+  if (-not $asset) { throw "Asset not found: $AssetId" }
+  $asset.Status = 'Returned'
+  $asset.Location = $To
+  $asset.Custodian = $null
+  $asset.Updated = NowIso
+  Write-Transaction -Db $db -AssetId $AssetId -Action 'Return' -By $By -FromLocation $From -ToLocation $To -Condition $Condition -Notes $Notes
+  Save-Db -Db $db -DbPath $DbPath
+  $asset
+}
+
+#endregion
+
+#region === Reporting ===
+
+function Get-Transaction {
+  [CmdletBinding(DefaultParameterSetName='All')] param(
+    [string]$DbPath,
+    [Parameter(ParameterSetName='ByAsset')][string]$AssetId,
+    [Parameter(ParameterSetName='ByAction')][ValidateSet('Pickup','Delivery','Return','Update')][string]$Action,
+    [Parameter(ParameterSetName='ByWho')][string]$By,
+    [datetime]$Since,
+    [datetime]$Until
+  )
+  $db = Load-Db -DbPath $DbPath
+  $tx = $db.Transactions
+  if ($PSBoundParameters.ContainsKey('AssetId')) { $tx = $tx | Where-Object { $_.AssetId -eq $AssetId } }
+  if ($PSBoundParameters.ContainsKey('Action'))  { $tx = $tx | Where-Object { $_.Action -eq $Action } }
+  if ($PSBoundParameters.ContainsKey('By'))      { $tx = $tx | Where-Object { $_.By -eq $By } }
+  if ($Since) { $tx = $tx | Where-Object { [datetime]$_.Timestamp -ge $Since } }
+  if ($Until) { $tx = $tx | Where-Object { [datetime]$_.Timestamp -le $Until } }
+  $tx | Sort-Object Timestamp -Descending
+}
+
+function Get-InventorySummary {
+  [CmdletBinding()] param([string]$DbPath)
+  $db = Load-Db -DbPath $DbPath
+  $byStatus = $db.Assets | Group-Object Status | ForEach-Object { [pscustomobject]@{ Status=$_.Name; Count=$_.Count } }
+  $byCustodian = $db.Assets | Where-Object { $_.Custodian } | Group-Object Custodian | ForEach-Object { [pscustomobject]@{ Custodian=$_.Name; Count=$_.Count } }
+  [pscustomobject]@{
+    Total      = $db.Assets.Count
+    ByStatus   = $byStatus
+    ByCustodian= $byCustodian
+    LastTx     = ($db.Transactions | Sort-Object Timestamp -Descending | Select-Object -First 1)
+    DbPath     = (Resolve-Path -Path ($DbPath ?? $script:DefaultDbPath)).Path
+  }
+}
+
+function Export-InventoryCsv {
+  [CmdletBinding()] param(
+    [string]$DbPath,
+    [string]$AssetCsv = (Join-Path $env:Public 'assets.csv'),
+    [string]$TxnCsv   = (Join-Path $env:Public 'transactions.csv')
+  )
+  $db = Load-Db -DbPath $DbPath
+  $db.Assets | Export-Csv -Path $AssetCsv -NoTypeInformation -Encoding UTF8
+  $db.Transactions | Export-Csv -Path $TxnCsv -NoTypeInformation -Encoding UTF8
+  Write-Host "Exported:`n - $AssetCsv`n - $TxnCsv"
+}
+
+#endregion
+
+#region === Interactive Console (Optional) ===
+
+function Start-InventoryConsole {
+  [CmdletBinding()] param([string]$DbPath)
+  do {
+    Clear-Host
+    Write-Host '=== Inventory Logistics ===' -ForegroundColor Cyan
+    $summary = Get-InventorySummary -DbPath $DbPath
+    Write-Host ("Total: {0} | Db: {1}" -f $summary.Total, $summary.DbPath)
+    Write-Host '1) Add Asset'
+    Write-Host '2) Pickup'
+    Write-Host '3) Delivery'
+    Write-Host '4) Return'
+    Write-Host '5) List Assets'
+    Write-Host '6) View Transactions'
+    Write-Host '7) Export CSV'
+    Write-Host 'Q) Quit'
+    $choice = Read-Host 'Select'
+    switch ($choice) {
+      '1' {
+        $name = Read-Host 'Name'; $serial = Read-Host 'Serial'; $loc = Read-Host 'Location'; $cust = Read-Host 'Custodian'
+        Add-Asset -Name $name -Serial $serial -Location $loc -Custodian $cust -DbPath $DbPath | Format-List | Out-Host
+        Pause
+      }
+      '2' {
+        $id = Read-Host 'AssetId'; $by = Read-Host 'Picked up by'; $from = Read-Host 'From'; $to = Read-Host 'To'; $cond = Read-Host 'Condition'; $notes = Read-Host 'Notes'
+        $method = Read-Host 'Confirm method (PIN/Signature)'
+        if ($method -eq 'PIN') {
+          Invoke-Pickup -AssetId $id -By $by -From $from -To $to -Condition $cond -Notes $notes -ConfirmMethod PIN -DbPath $DbPath | Format-List | Out-Host
+        } else {
+          $sig = Read-Host 'Type signature name'
+          Invoke-Pickup -AssetId $id -By $by -From $from -To $to -Condition $cond -Notes $notes -ConfirmMethod Signature -SignatureName $sig -DbPath $DbPath | Format-List | Out-Host
+        }
+        Pause
+      }
+      '3' {
+        $id = Read-Host 'AssetId'; $by = Read-Host 'Delivered by'; $to = Read-Host 'Delivered to (user/team)'; $loc = Read-Host 'Location'; $cond = Read-Host 'Condition'; $notes = Read-Host 'Notes'
+        Invoke-Delivery -AssetId $id -By $by -To $to -Location $loc -Condition $cond -Notes $notes -DbPath $DbPath | Format-List | Out-Host
+        Pause
+      }
+      '4' {
+        $id = Read-Host 'AssetId'; $by = Read-Host 'Processed by'; $from = Read-Host 'From'; $to = Read-Host 'To'; $cond = Read-Host 'Condition'; $notes = Read-Host 'Notes'
+        Invoke-Return -AssetId $id -By $by -From $from -To $to -Condition $cond -Notes $notes -DbPath $DbPath | Format-List | Out-Host
+        Pause
+      }
+      '5' { Get-Asset -DbPath $DbPath | Sort-Object Name | Format-Table AssetId,Name,Serial,Status,Location,Custodian -AutoSize | Out-Host; Pause }
+      '6' { Get-Transaction -DbPath $DbPath | Select-Object Timestamp,Action,AssetId,By,For,From,To,Condition,Notes,ConfirmMethod,ConfirmBy | Format-Table -AutoSize | Out-Host; Pause }
+      '7' { Export-InventoryCsv -DbPath $DbPath; Pause }
+      'Q' { break }
+      default { }
+    }
+  } while ($true)
+}
+
+#endregion
+
+#region === Usage Examples (commented) ===
+<#
+# Add two assets
+$asset1 = Add-Asset -Name 'Adobe Creative Cloud License' -Serial 'ACC-123-XYZ' -Location 'Warehouse'
+$asset2 = Add-Asset -Name 'Laptop - Dell 5420' -Serial 'DL-5420-9921' -Location 'Warehouse'
+
+# Deliver laptop to user
+Invoke-Delivery -AssetId $asset2.AssetId -By 'Sam Ops' -To 'Jane Doe' -Location 'NYC Office' -Notes 'New hire'
+
+# Pickup license from user into warehouse
+Invoke-Pickup -AssetId $asset1.AssetId -By 'Courier A' -From 'User' -To 'Warehouse' -Condition 'OK'
+
+# Return laptop from user to warehouse
+Invoke-Return -AssetId $asset2.AssetId -By 'Sam Ops' -From 'Jane Doe' -To 'Warehouse' -Condition 'Good' -Notes 'Offboarding'
+
+# Query
+Get-Asset -Query 'Dell'
+Get-Transaction -Action Delivery -Since (Get-Date).AddDays(-7)
+
+# Interactive console
+Start-InventoryConsole
+#>
+#endregion
