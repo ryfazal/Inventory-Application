@@ -84,6 +84,10 @@ function Write-Transaction {
     Timestamp   = NowIso
   }
   $Db.Transactions += [pscustomobject]$tx
+  # push to ServiceNow if configured
+  if (Get-Command Sync-TransactionToServiceNow -ErrorAction SilentlyContinue) {
+    Sync-TransactionToServiceNow -Db $Db -Tx $tx | Out-Null
+  }
 }
 
 function Get-Hash {
@@ -349,6 +353,201 @@ function Invoke-Return {
   Write-Transaction -Db $db -AssetId $AssetId -Action 'Return' -By $By -FromLocation $From -ToLocation $To -Condition $Condition -Notes $Notes
   Save-Db -Db $db -DbPath $DbPath
   $asset
+}
+
+#endregion
+
+#region === ServiceNow Integration ===
+
+function Install-ServiceNowModule {
+  [CmdletBinding()] param([switch]$Force)
+  $name = 'ServiceNow'
+  if (-not (Get-Module -ListAvailable -Name $name)) {
+    Install-Module -Name $name -Scope CurrentUser -Force:$Force -AllowClobber -ErrorAction Stop
+  }
+  Import-Module $name -ErrorAction Stop
+}
+
+function Set-ServiceNowConfig {
+  <#
+  .SYNOPSIS
+    Configure ServiceNow connection and target table (incident or sc_task) and autosync.
+  .PARAMETER InstanceUrl
+    Full URL, e.g. https://dev12345.service-now.com
+  .PARAMETER Credential
+    PSCredential for a ServiceNow user or API user.
+  .PARAMETER Table
+    Target table: incident or sc_task (defaults to incident).
+  .PARAMETER AutoSync
+    If set, each new transaction is pushed to ServiceNow automatically.
+  #>
+  [CmdletBinding()] param(
+    [Parameter(Mandatory)][string]$InstanceUrl,
+    [Parameter(Mandatory)][pscredential]$Credential,
+    [ValidateSet('incident','sc_task')][string]$Table = 'incident',
+    [switch]$AutoSync,
+    [string]$DbPath
+  )
+  $db = Load-Db -DbPath $DbPath
+  if (-not $db.ContainsKey('Settings')) { $db.Settings = @{} }
+  if (-not $db.Settings.ContainsKey('ServiceNow')) { $db.Settings.ServiceNow = @{} }
+  $db.Settings.ServiceNow.InstanceUrl = $InstanceUrl
+  $db.Settings.ServiceNow.Username   = $Credential.UserName
+  $db.Settings.ServiceNow.Table      = $Table
+  $db.Settings.ServiceNow.AutoSync   = [bool]$AutoSync
+  $db.Settings.ServiceNow.CorrelationField = 'correlation_id'
+  Save-Db -Db $db -DbPath $DbPath
+  $script:SNConfig = [ordered]@{
+    InstanceUrl = $InstanceUrl
+    Credential  = $Credential
+    Table       = $Table
+    AutoSync    = [bool]$AutoSync
+    CorrelationField = 'correlation_id'
+  }
+  $db.Settings.ServiceNow
+}
+
+function Get-ServiceNowConfig {
+  [CmdletBinding()] param([string]$DbPath)
+  if ($script:SNConfig) { return $script:SNConfig }
+  $db = Load-Db -DbPath $DbPath
+  if ($db.Settings -and $db.Settings.ServiceNow) {
+    return $db.Settings.ServiceNow
+  }
+}
+
+function Test-ServiceNowConnection {
+  [CmdletBinding()] param([string]$DbPath)
+  Install-ServiceNowModule
+  $conf = Get-ServiceNowConfig -DbPath $DbPath
+  if (-not $conf) { throw 'ServiceNow not configured. Run Set-ServiceNowConfig first.' }
+  $cred = if ($script:SNConfig -and $script:SNConfig.Credential) { $script:SNConfig.Credential } else { Get-Credential -UserName $conf.Username -Message 'Enter ServiceNow password' }
+  Set-ServiceNowAuth -Url $conf.InstanceUrl -Credential $cred | Out-Null
+  # probe both sys_user and chosen table access
+  $null = Get-ServiceNowTable -Table 'sys_user' -Limit 1 -ErrorAction Stop
+  $null = Get-ServiceNowTable -Table $conf.Table -Limit 1 -ErrorAction Stop
+  'OK'
+}
+
+function Resolve-ServiceNowUser {
+  <#
+    Resolve a ServiceNow sys_user sys_id by email, username, or name. Returns null if not found.
+  #>
+  [CmdletBinding()] param([Parameter(Mandatory)][string]$Identity)
+  try {
+    $query = @()
+    if ($Identity -match '@') { $query += "emailLIKE$Identity" }
+    $query += "user_nameLIKE$Identity"
+    $query += "nameLIKE$Identity"
+    $q = ($query -join '^OR')
+    $u = Get-ServiceNowTable -Table 'sys_user' -Query $q -Limit 1 -ErrorAction Stop
+    return $u.sys_id
+  } catch { return $null }
+}
+
+function Find-ServiceNowRecord {
+  [CmdletBinding()] param(
+    [Parameter(Mandatory)][string]$Table,
+    [Parameter(Mandatory)][string]$CorrelationField,
+    [Parameter(Mandatory)][string]$CorrelationValue
+  )
+  Get-ServiceNowTable -Table $Table -Query ("${CorrelationField}=${CorrelationValue}") -Limit 1 -ErrorAction SilentlyContinue
+}
+
+function Sync-TransactionToServiceNow {
+  [CmdletBinding()] param(
+    [Parameter(Mandatory)][hashtable]$Db,
+    [Parameter(Mandatory)][object]$Tx,
+    [pscredential]$Credential,
+    [switch]$Force
+  )
+  try {
+    $conf = if ($script:SNConfig) { $script:SNConfig } else { $Db.Settings?.ServiceNow }
+    if (-not $conf) { return }
+    if (-not $Force -and -not [bool]$conf.AutoSync) { return }
+    Install-ServiceNowModule
+    $cred = if ($Credential) { $Credential } elseif ($script:SNConfig -and $script:SNConfig.Credential) { $script:SNConfig.Credential } else { Get-Credential -UserName $conf.Username -Message 'ServiceNow password' }
+    Set-ServiceNowAuth -Url $conf.InstanceUrl -Credential $cred | Out-Null
+
+    $table = $conf.Table
+    $corrField = $conf.CorrelationField
+
+    # attempt to resolve people
+    $callerId   = Resolve-ServiceNowUser -Identity ($Tx.For   | ForEach-Object { $_ })
+    $openedById = Resolve-ServiceNowUser -Identity ($Tx.By    | ForEach-Object { $_ })
+
+    # build values depending on table
+    $commonShort = "Inventory ${($Tx.Action)} — Asset ${($Tx.AssetId)}"
+    $commonDesc  = "By: $($Tx.By); For: $($Tx.For); From: $($Tx.From); To: $($Tx.To); Condition: $($Tx.Condition); Notes: $($Tx.Notes)"
+
+    $values = @{}
+    if ($table -eq 'incident') {
+      $values = @{
+        short_description = $commonShort
+        description       = $commonDesc
+        $corrField        = $Tx.TxId
+      }
+      if ($callerId)   { $values.caller_id  = $callerId }
+      if ($openedById) { $values.opened_by  = $openedById }
+    } else { # sc_task
+      $values = @{
+        short_description = $commonShort
+        description       = $commonDesc
+        $corrField        = $Tx.TxId
+      }
+      if ($openedById) { $values.assigned_to = $openedById }
+    }
+
+    # upsert by correlation_id
+    $existing = Find-ServiceNowRecord -Table $table -CorrelationField $corrField -CorrelationValue $Tx.TxId
+    if ($existing) {
+      Update-ServiceNowRecord -Table $table -SysId $existing.sys_id -Values $values | Out-Null
+    } else {
+      New-ServiceNowRecord -Table $table -Values $values | Out-Null
+    }
+  } catch {
+    Write-Warning "ServiceNow sync failed: $_"
+  }
+}
+
+function Sync-ServiceNowToLocal {
+  <#
+    Pull status from ServiceNow into the local DB and append an 'Update' transaction if state changed.
+    We match by correlation_id == TxId.
+  #>
+  [CmdletBinding()] param(
+    [string]$DbPath
+  )
+  $db = Load-Db -DbPath $DbPath
+  $conf = Get-ServiceNowConfig -DbPath $DbPath
+  if (-not $conf) { throw 'ServiceNow not configured.' }
+  Install-ServiceNowModule
+  $cred = if ($script:SNConfig -and $script:SNConfig.Credential) { $script:SNConfig.Credential } else { Get-Credential -UserName $conf.Username -Message 'ServiceNow password' }
+  Set-ServiceNowAuth -Url $conf.InstanceUrl -Credential $cred | Out-Null
+
+  $table = $conf.Table
+  $corrField = $conf.CorrelationField
+
+  foreach ($tx in $db.Transactions) {
+    $rec = Find-ServiceNowRecord -Table $table -CorrelationField $corrField -CorrelationValue $tx.TxId
+    if (-not $rec) { continue }
+
+    $snState = $rec.state
+    $snNumber = $rec.number
+    $note = "ServiceNow ${table} ${snNumber} state=${snState}"
+
+    # only log if we haven't already logged this state change
+    $already = $db.Transactions | Where-Object { $_.Action -eq 'Update' -and $_.Notes -like "*${snNumber}*state=${snState}*" -and $_.AssetId -eq $tx.AssetId }
+    if (-not $already) {
+      Write-Transaction -Db $db -AssetId $tx.AssetId -Action 'Update' -By 'ServiceNow' -Notes $note
+    }
+  }
+  Save-Db -Db $db -DbPath $DbPath
+}
+
+function Sync-AllFromServiceNow {
+  [CmdletBinding()] param([string]$DbPath)
+  Sync-ServiceNowToLocal -DbPath $DbPath
 }
 
 #endregion
