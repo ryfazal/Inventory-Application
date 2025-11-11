@@ -1,0 +1,21 @@
+# 1) Rename script to InventoryApp.ps1 
+
+Load the script
+  Rename script to InventoryApp.ps1
+. .\InventoryApp.ps1
+
+# 2) Configure ServiceNow (choose ONE auth method)
+
+# Bearer token:
+Set-ServiceNowConfig -Instance 'yourcompany.service-now.com' -Token '<YOUR_TOKEN>' -Table 'x_inventory_tx' -AutoSync
+
+# OR Basic auth:
+Set-ServiceNowConfig -Instance 'yourcompany.service-now.com' -Username 'me' -Password (Read-Host -AsSecureString) -Table 'x_inventory_tx' -AutoSync
+
+# 3) Create a transaction and sync
+$tx = New-InventoryTransaction -Type Pickup -Sku 'SKU-001' -Qty 3 -From 'WH1' -Ref 'SN-DEMO' -SyncServiceNow
+#   OR later:
+Sync-TransactionToServiceNow -Id $tx.id
+
+# 4) Complete and auto-sync
+Complete-InventoryTransaction -Id $tx.id
