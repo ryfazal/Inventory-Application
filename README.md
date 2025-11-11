@@ -1,151 +1,89 @@
-# 📦 InventoryApp — PowerShell Inventory Management System
+# ServiceNow Integration for InventoryApp
 
-![PowerShell](https://img.shields.io/badge/PowerShell-7+-blue?logo=powershell)
-![License](https://img.shields.io/badge/License-MIT-green)
-![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey)
-
-A lightweight, offline-friendly PowerShell application for tracking **inventory pickups, deliveries, returns, transfers, and adjustments** — complete with **secure pickup confirmation** (via OTP code or signature verification).
+This package provides a ready-to-import ServiceNow schema and guide for integrating the **PowerShell InventoryApp** with your ServiceNow instance.  
+It enables automatic and manual synchronization of inventory transactions (Pickups, Deliveries, Returns, etc.) between PowerShell and ServiceNow.
 
 ---
 
-## 🧰 Features
-
-✅ Interactive text menu for managing inventory  
-✅ JSON-based local datastore (`inventory_store.json`)  
-✅ Immutable transaction log (audit-friendly)  
-✅ Pickup confirmation via **OTP** or **signature file**  
-✅ Export reports to CSV  
-✅ Built-in backups and easy restore  
-
----
-
-## ⚙️ Prerequisites
-
-- Windows PowerShell 5.1 **or** PowerShell 7+
-- Script execution enabled (if blocked, run this once):
-  ```powershell
-  Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-  ```
+## 📁 Contents
+| File | Description |
+|------|--------------|
+| **ServiceNow_Integration_Guide.pdf** | Step-by-step guide for setup and configuration |
+| **ServiceNow_Table_x_inventory_tx.xml** | Defines the target table `x_inventory_tx` and all fields |
+| **ServiceNow_ImportSet_TransformMap_x_inventory_tx.xml** | Defines import set table `u_inventory_tx_import` and Transform Map |
+| **InventoryApp.ps1** | (Not included here) PowerShell app that integrates with ServiceNow |
 
 ---
 
-## 🚀 Installation
+## 🚀 Setup Instructions
 
-1. **Download** the repository or ZIP package  
-   (includes `InventoryApp.ps1` and `inventory_store.json`)
-2. Extract it somewhere easy, e.g.:
-   ```
-   C:\InventoryApp
-   ```
-3. **Run PowerShell**, then:
-   ```powershell
-   cd "C:\InventoryApp"
-   .\InventoryApp.ps1
-   ```
+### 1. Import the Target Table
+1. In your ServiceNow instance, go to **System Definition → Tables**.
+2. Use the ☰ (hamburger) menu → **Import XML**.
+3. Upload and import `ServiceNow_Table_x_inventory_tx.xml`.
 
-If you see nothing happen, unblock the file first:
+You’ll see a new table named `x_inventory_tx` with fields:
+`u_tx_id`, `u_type`, `u_sku`, `u_qty`, `u_from`, `u_to`, `u_status`, `u_ref`, `u_confirmed`, `u_picker`, and `u_updated`.
+
+---
+
+### 2. Import the Import Set & Transform Map
+1. Go to **System Import Sets → Load Data**.
+2. Use **Import XML** again to upload `ServiceNow_ImportSet_TransformMap_x_inventory_tx.xml`.
+3. Verify:
+   - Import set table: `u_inventory_tx_import`
+   - Transform Map: `Inventory TX Import to x_inventory_tx`
+   - Coalesce key: `u_tx_id`
+
+---
+
+### 3. Configure PowerShell InventoryApp
+
+Use the ServiceNow integration functions built into your PowerShell script:
+
 ```powershell
-Unblock-File .\InventoryApp.ps1
+# Configure with Bearer Token
+Set-ServiceNowConfig -Instance 'yourcompany.service-now.com' -Token '<YOUR_TOKEN>' -AutoSync
+
+# Or configure with Basic Auth
+Set-ServiceNowConfig -Instance 'yourcompany.service-now.com' -Username 'admin' -Password (Read-Host -AsSecureString) -AutoSync
 ```
 
 ---
 
-## 🧮 Menu Overview
+### 4. Sync Transactions
 
-| Option | Action |
-|--------|---------|
-| 1 | List Items |
-| 2 | Add Item |
-| 3 | New Transaction (Pickup/Delivery/Return/Transfer/Adjustment) |
-| 4 | List Transactions |
-| 5 | Complete Transaction |
-| 6 | Report Snapshot |
-| 7 | Export Snapshot CSV |
-| 8 | Export Transactions CSV |
-| 9 | Backup Store |
-| 10 | Generate Pickup Code |
-| 11 | Confirm Pickup |
-| 0 | Exit |
+**Automatic Sync:**  
+Enabled via `-AutoSync` during setup. Every new or completed transaction is posted to ServiceNow.
 
----
-
-## 🔐 Pickup Confirmation Workflow
-
-Before completing a **Pickup**, the person collecting the item must confirm possession:
-
-### 🔹 Step 1 — Generate a Pickup Code
+**Manual Sync:**  
 ```powershell
-New-PickupCode -Id <pickupTxId> -PickerName "John Smith"
-```
-Displays a **6-digit code** valid for ~15 minutes.
-
-### 🔹 Step 2 — Confirm Pickup
-**Option 1: OTP code**
-```powershell
-Confirm-Pickup -Id <pickupTxId> -PickerName "John Smith" -Code 123456
-```
-
-**Option 2: Signature file**
-```powershell
-Confirm-Pickup -Id <pickupTxId> -PickerName "John Smith" -SignaturePath "C:\signatures\john.png"
-```
-
-### 🔹 Step 3 — Complete the Pickup
-```powershell
-Complete-InventoryTransaction -Id <pickupTxId>
+Sync-TransactionToServiceNow -Id <TransactionId>
 ```
 
 ---
 
-## 💾 Data Storage
+### 5. Test the Import Set
 
-All app data (items, locations, transactions) lives in:
+You can bulk-load transactions using CSV:
+
+```csv
+tx_id,type,sku,qty,from,to,status,ref,confirmed,picker,updated
+TX123,Pickup,SKU-001,5,WH1,CustomerDock,Open,ORDER-1001,true,Alex,"2025-11-10 10:45:00"
 ```
-inventory_store.json
-```
-You can back it up anytime from the menu (`9) Backup Store`) or manually copy the file.
+
+1. Upload via **System Import Sets → Load Data** → select `u_inventory_tx_import`.
+2. Run Transform → select `Inventory TX Import to x_inventory_tx`.
 
 ---
 
-## 📤 Exporting Reports
+## 🔍 Troubleshooting
 
-| Command | Description |
-|----------|--------------|
-| `Export-InventoryCsv -Path './snapshot.csv'` | Export inventory snapshot |
-| `Export-TransactionsCsv -Path './transactions.csv'` | Export transaction log |
-
----
-
-## 🧠 Troubleshooting
-
-| Issue | Cause | Fix |
-|-------|--------|-----|
-| Script won’t run | Execution policy restriction | `Set-ExecutionPolicy RemoteSigned` |
-| Nothing happens | Script blocked | `Unblock-File .\InventoryApp.ps1` |
-| Can’t complete pickup | Not confirmed | Use `Confirm-Pickup` first |
-
----
-
-## 🧩 Using as a Module
-
-You can also dot-source and use functions directly:
-```powershell
-. .\InventoryApp.ps1
-Initialize-InventoryStore -Path './store.json'
-Add-InventoryItem -Sku 'SKU-001' -Name 'Widget A' -Location 'WH1' -Qty 100
-```
+- Ensure the ServiceNow user has **import_set_loader** and **rest_service** roles.
+- Verify the instance URL and credentials.
+- If duplicate records appear, check that `u_tx_id` is set as **coalesce**.
+- Use PowerShell’s `Write-Store` and `Read-Store` to inspect the JSON datastore.
 
 ---
 
 ## 🧾 License
-
-MIT License © 2025 — Developed with ❤️ using PowerShell Automation
-
----
-
-## 🖼️ Screenshots (optional)
-
-> _Add your screenshots or GIF demos here:_
->
-> ![Menu Screenshot](docs/menu-demo.png)
-> ![Pickup Confirmation](docs/pickup-confirmation.png)
